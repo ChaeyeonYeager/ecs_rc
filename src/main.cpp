@@ -1,40 +1,49 @@
 #include <Arduino.h>
 #include "PinChangeInterrupt.h"
 
-// — 수신기 채널 입력 핀 정의 —
-// A0: CH3 → 모드 전환 스위치
-// A1: CH2 → 밝기 조절 스틱
-const int pinModeSwitch   = A0;
-const int pinBrightness   = A1;
+// — ISR 프로토타입 —
+void isrPowerSwitch();
+void isrColorControl();
+void isrBrightness();
 
-// — PWM 신호 측정 변수 —
-// modePulseWidth: CH3 펄스 폭 (μs 단위)
-// brightPulseWidth: CH2 펄스 폭 (μs 단위)
-volatile int           modePulseWidth    = 1500;
-volatile unsigned long modeStartMicros   = 0;
-volatile bool          newModePulse      = false;
+// — 수신기 채널 입력 핀 정의 —
+// A2: CH5(AUX1) ← SwA 스위치 (전원 ON/OFF)
+// A0: CH3 ← 스로틀 스틱 (색상 제어, 서서히 변화)
+// A1: CH2 ← 엘리베이터 스틱 (밝기 조절)
+const int pinPowerSwitch = A2;
+const int pinColorCtrl   = A0;
+const int pinBrightness  = A1;
+
+// — PWM 신호 저장 변수 —
+volatile int           powerPulseWidth   = 1500;
+volatile unsigned long powerStartMicros  = 0;
+volatile bool          newPowerPulse     = false;
+
+volatile int           colorPulseWidth   = 1500;
+volatile unsigned long colorStartMicros  = 0;
+volatile bool          newColorPulse     = false;
 
 volatile int           brightPulseWidth  = 1500;
 volatile unsigned long brightStartMicros = 0;
 volatile bool          newBrightPulse    = false;
 
-// — RGB LED 핀 정의 (common-cathode) —
-// R, G, B 각각 아노드에 220Ω 저항 후 연결
+// — RGB LED 핀 (common-cathode) —
 const int pinR = 9;
 const int pinG = 10;
 const int pinB = 11;
 
-// — RGB 순환 모드 변수 —
-unsigned long lastCycleMs   = 0;
-int          cycleIndex     = 0;                // 0: R, 1: G, 2: B
-const unsigned long cycleInterval = 1000;       // 1초 간격
-
 void setup() {
-  // 수신신호용 핀 설정
-  pinMode(pinModeSwitch, INPUT_PULLUP);
+  // SwA (CH5) ISR 등록 → 전원 ON/OFF
+  pinMode(pinPowerSwitch, INPUT_PULLUP);
+  attachPCINT(digitalPinToPCINT(pinPowerSwitch), isrPowerSwitch, CHANGE);
+
+  // CH3 (색상 제어) ISR 등록 → hue 제어
+  pinMode(pinColorCtrl, INPUT_PULLUP);
+  attachPCINT(digitalPinToPCINT(pinColorCtrl), isrColorControl, CHANGE);
+
+  // CH2 (밝기) ISR 등록
   pinMode(pinBrightness, INPUT_PULLUP);
-  attachPCINT(digitalPinToPCINT(pinModeSwitch),   isrModeSwitch,   CHANGE);
-  attachPCINT(digitalPinToPCINT(pinBrightness),   isrBrightness,   CHANGE);
+  attachPCINT(digitalPinToPCINT(pinBrightness), isrBrightness, CHANGE);
 
   // RGB LED 핀 출력 설정
   pinMode(pinR, OUTPUT);
@@ -44,70 +53,105 @@ void setup() {
   Serial.begin(9600);
 }
 
-// CH3 (모드 스위치) ISR
-void isrModeSwitch() {
-  if (digitalRead(pinModeSwitch) == HIGH) {
-    modeStartMicros = micros();
-  } else if (modeStartMicros && !newModePulse) {
-    modePulseWidth = micros() - modeStartMicros;
-    modeStartMicros = 0;
-    newModePulse   = true;
+void loop() {
+  // ISR에서 갱신된 PWM 폭 읽기
+  int pwmPower  = powerPulseWidth;   // SwA
+  int pwmColor  = colorPulseWidth;   // CH3
+  int pwmBright = brightPulseWidth;  // CH2
+
+  // CH2 → 밝기(0~255)
+  int brightness = map(pwmBright, 1000, 2000, 0, 255);
+  brightness = constrain(brightness, 0, 255);
+
+  // 전원 OFF
+  if (pwmPower < 1500) {
+    analogWrite(pinR, 0);
+    analogWrite(pinG, 0);
+    analogWrite(pinB, 0);
+    return;
+  }
+
+  // CH3 → hue (0~255)
+  int hue = map(pwmColor, 1000, 2000, 0, 255);
+  hue = constrain(hue, 0, 255);
+
+  // HSV → RGB 변환 (V=255)
+  int r, g, b;
+  if (hue < 85) {
+    // 0..84 : red→green
+    r = 255 - hue * 3;
+    g = hue * 3;
+    b = 0;
+  } else if (hue < 170) {
+    // 85..169 : green→blue
+    int h2 = hue - 85;
+    r = 0;
+    g = 255 - h2 * 3;
+    b = h2 * 3;
+  } else {
+    // 170..255 : blue→red
+    int h2 = hue - 170;
+    r = h2 * 3;
+    g = 0;
+    b = 255 - h2 * 3;
+  }
+
+  // 밝기(brightness) 적용
+  r = (r * brightness) / 255;
+  g = (g * brightness) / 255;
+  b = (b * brightness) / 255;
+
+  // LED 출력
+  analogWrite(pinR, r);
+  analogWrite(pinG, g);
+  analogWrite(pinB, b);
+
+  // (선택) 시리얼 디버그
+  if (newPowerPulse) {
+    Serial.print("Power PWM: ");  Serial.println(pwmPower);
+    newPowerPulse = false;
+  }
+  if (newColorPulse) {
+    Serial.print("Color PWM: ");  Serial.println(pwmColor);
+    newColorPulse = false;
+  }
+  if (newBrightPulse) {
+    Serial.print("Bright PWM: "); Serial.println(pwmBright);
+    newBrightPulse = false;
   }
 }
 
-// CH2 (밝기 조절) ISR
+// — ISR 정의 —
+
+// SwA (CH5) → 전원 제어
+void isrPowerSwitch() {
+  if (digitalRead(pinPowerSwitch) == HIGH) {
+    powerStartMicros = micros();
+  } else {
+    powerPulseWidth   = micros() - powerStartMicros;
+    powerStartMicros  = 0;
+    newPowerPulse     = true;
+  }
+}
+
+// CH3 → 색상 제어 (hue)
+void isrColorControl() {
+  if (digitalRead(pinColorCtrl) == HIGH) {
+    colorStartMicros = micros();
+  } else if (colorStartMicros && !newColorPulse) {
+    colorPulseWidth  = micros() - colorStartMicros;
+    colorStartMicros = 0;
+    newColorPulse    = true;
+  }
+}
+
+// CH2 → 밝기
 void isrBrightness() {
   if (digitalRead(pinBrightness) == HIGH) {
     brightStartMicros = micros();
   } else if (brightStartMicros && !newBrightPulse) {
-    brightPulseWidth = micros() - brightStartMicros;
+    brightPulseWidth  = micros() - brightStartMicros;
     brightStartMicros = 0;
-    newBrightPulse   = true;
+    newBrightPulse    = true;
   }
-}
-
-void loop() {
-  // 최근 측정된 펄스 폭 읽기
-  int pwmMode   = modePulseWidth;    // CH3
-  int pwmBright = brightPulseWidth;  // CH2
-
-  // CH2(1000~2000μs) → 밝기(0~255)
-  int brightness = map(pwmBright, 1000, 2000, 0, 255);
-  brightness = constrain(brightness, 0, 255);
-
-  // 모드 분기
-  if (pwmMode < 1200) {
-    // 모드0: LED 완전 OFF
-    analogWrite(pinR, 0);
-    analogWrite(pinG, 0);
-    analogWrite(pinB, 0);
-
-  } else if (pwmMode < 1700) {
-    // 모드1: 흰색 모드 (세 채널 동일 밝기)
-    analogWrite(pinR, brightness);
-    analogWrite(pinG, brightness);
-    analogWrite(pinB, brightness);
-
-  } else {
-    // 모드2: RGB 순환 모드
-    unsigned long now = millis();
-    if (now - lastCycleMs > cycleInterval) {
-      lastCycleMs = now;
-      cycleIndex = (cycleIndex + 1) % 3;
-    }
-    // 현재 색상만 밝기 조절, 나머지 채널은 0
-    analogWrite(pinR, (cycleIndex == 0) ? brightness : 0);
-    analogWrite(pinG, (cycleIndex == 1) ? brightness : 0);
-    analogWrite(pinB, (cycleIndex == 2) ? brightness : 0);
-  }
-
-  // 디버그: 펄스 폭 변화 시 시리얼 출력
-  if (newBrightPulse) {
-    Serial.print("CH2 PWM: "); Serial.println(pwmBright);
-    newBrightPulse = false;
-  }
-  if (newModePulse) {
-    Serial.print("CH3 PWM: "); Serial.println(pwmMode);
-    newModePulse = false;
-  }
-}
+} 
